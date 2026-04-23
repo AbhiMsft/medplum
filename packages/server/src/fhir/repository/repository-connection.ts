@@ -9,6 +9,7 @@ import { DatabaseMode, getDatabasePool } from '../../database';
 import { getLogger } from '../../logger';
 import type { TransactionIsolationLevel } from '../sql';
 import { isRetryableTransactionError, normalizeDatabaseError } from '../sql';
+import type { RepositoryAccessTracker } from './access-tracker';
 
 const defaultTransactionAttempts = 2;
 const defaultExpBackoffBaseDelayMs = 50;
@@ -189,6 +190,7 @@ export class RepositoryConnection implements Disposable {
 
   async withTransaction<TResult>(
     callback: (client: PoolClient) => Promise<TResult>,
+    accessTracker: RepositoryAccessTracker,
     options?: { serializable?: boolean }
   ): Promise<TResult> {
     this.assertNotClosed();
@@ -201,9 +203,9 @@ export class RepositoryConnection implements Disposable {
     for (let attempt = 0; attempt < transactionAttempts; attempt++) {
       const attemptStartTime = Date.now();
       try {
-        const client = await this.beginTransaction(isolationLevel);
+        const client = await this.beginTransaction(isolationLevel, accessTracker);
         const result = await callback(client);
-        await this.commitTransaction();
+        await this.commitTransaction(accessTracker);
         if (attempt > 0) {
           getLogger().info('Completed transaction', {
             attempt,
@@ -219,7 +221,7 @@ export class RepositoryConnection implements Disposable {
         error = operationOutcomeError;
 
         // Ensure transaction is rolled back before attempting any retry
-        await this.rollbackTransaction(operationOutcomeError);
+        await this.rollbackTransaction(operationOutcomeError, accessTracker);
         if (this.transactionDepth || !isRetryableTransactionError(operationOutcomeError)) {
           break; // Fall through to throw statement outside of the loop
         }
@@ -261,7 +263,10 @@ export class RepositoryConnection implements Disposable {
     throw error;
   }
 
-  private async beginTransaction(isolationLevel: TransactionIsolationLevel): Promise<PoolClient> {
+  private async beginTransaction(
+    isolationLevel: TransactionIsolationLevel,
+    accessTracker: RepositoryAccessTracker
+  ): Promise<PoolClient> {
     this.assertNotClosed();
     const nextDepth = this.transactionDepth + 1;
     const conn = await this.getConnection(DatabaseMode.WRITER);
@@ -285,10 +290,11 @@ export class RepositoryConnection implements Disposable {
     }
     this.transactionDepth = nextDepth;
     this.pushCallbackFrame();
+    accessTracker.pushTransactionFrame();
     return conn;
   }
 
-  private async commitTransaction(): Promise<void> {
+  private async commitTransaction(accessTracker: RepositoryAccessTracker): Promise<void> {
     this.assertInTransaction();
     const conn = await this.getConnection(DatabaseMode.WRITER);
     if (this.transactionDepth === 1) {
@@ -299,6 +305,8 @@ export class RepositoryConnection implements Disposable {
       this.releaseConnection();
       this.clearCallbackStack();
       await this.processPostCommit();
+      const frame = accessTracker.popTransactionFrame();
+      accessTracker.logTransactionAccess(frame, 'committed');
     } else {
       // If RELEASE SAVEPOINT fails (e.g. transaction in aborted state), let the error propagate.
       // withTransaction's catch will invoke rollbackTransaction, which can run ROLLBACK TO SAVEPOINT
@@ -307,10 +315,11 @@ export class RepositoryConnection implements Disposable {
       await conn.query('RELEASE SAVEPOINT sp' + this.transactionDepth);
       this.transactionDepth--; // safe to decrement since assertInTransaction() ensures transactionDepth > 0
       this.popCallbackFrame();
+      accessTracker.mergeLastTransactionFrame();
     }
   }
 
-  private async rollbackTransaction(error: Error): Promise<void> {
+  private async rollbackTransaction(error: Error, accessTracker: RepositoryAccessTracker): Promise<void> {
     // Tolerate being called after state has already been reset (e.g. when a prior
     // cleanup path in commit/rollback fully aborted the transaction on a dead connection).
     if (this.transactionDepth === 0) {
@@ -332,7 +341,7 @@ export class RepositoryConnection implements Disposable {
         err: normalizeErrorString(rollbackErr),
         originalErr: normalizeErrorString(error),
       });
-      this.abortTransaction(error);
+      this.abortTransaction(error, accessTracker);
       return;
     }
     this.transactionDepth--; // safe to decrement since early return if transactionDepth === 0
@@ -340,6 +349,10 @@ export class RepositoryConnection implements Disposable {
     if (isOuter) {
       this.transactionIsolationLevel = undefined;
       this.releaseConnection(error);
+      const frame = accessTracker.popTransactionFrame();
+      accessTracker.logTransactionAccess(frame, 'rolled_back');
+    } else {
+      accessTracker.mergeLastTransactionFrame();
     }
   }
 
@@ -349,12 +362,14 @@ export class RepositoryConnection implements Disposable {
    * Invoked from commit/rollback error paths when further recovery on the current
    * connection is not possible.
    * @param err - The error that triggered the abort; forwarded to `release()`.
+   * @param accessTracker - The access tracker to log the transaction access.
    */
-  private abortTransaction(err: Error): void {
+  private abortTransaction(err: Error, accessTracker: RepositoryAccessTracker): void {
     this.transactionDepth = 0;
     this.transactionIsolationLevel = undefined;
     this.clearCallbackStack();
     this.releaseConnection(err);
+    accessTracker.clearTransactionFrames();
   }
 
   private endTransaction(): void {
@@ -408,12 +423,15 @@ export class RepositoryConnection implements Disposable {
     }
   }
 
-  async ensureInTransaction<TResult>(callback: (client: PoolClient) => Promise<TResult>): Promise<TResult> {
+  async ensureInTransaction<TResult>(
+    callback: (client: PoolClient) => Promise<TResult>,
+    accessTracker: RepositoryAccessTracker
+  ): Promise<TResult> {
     if (this.transactionDepth) {
       const client = await this.getConnection(DatabaseMode.WRITER);
       return callback(client);
     } else {
-      return this.withTransaction(callback);
+      return this.withTransaction(callback, accessTracker);
     }
   }
 
