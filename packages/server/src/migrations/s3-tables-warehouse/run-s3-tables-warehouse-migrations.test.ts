@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { MedplumServerConfig } from '../../config/types';
-import * as tableNames from './warehouse-table-names';
 import { runS3TablesWarehouseMigrationsIfNeeded } from './run-s3-tables-warehouse-migrations';
+import * as tableNames from './warehouse-table-names';
 
 jest.mock('./s3-tables-client', () => ({
   createS3TablesClient: jest.fn(() => ({ send: jest.fn() })),

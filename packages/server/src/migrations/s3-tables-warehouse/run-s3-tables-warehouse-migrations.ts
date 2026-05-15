@@ -3,11 +3,7 @@
 
 import type { MedplumServerConfig } from '../../config/types';
 import { globalLogger } from '../../logger';
-import {
-  createS3TablesClient,
-  ensureNamespaceExists,
-  ensureWarehouseHistoryIcebergTable,
-} from './s3-tables-client';
+import { createS3TablesClient, ensureNamespaceExists, ensureWarehouseHistoryIcebergTable } from './s3-tables-client';
 import {
   DEFAULT_WAREHOUSE_NAMESPACE,
   getWarehouseSyncPostgresTableNames,
