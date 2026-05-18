@@ -102,8 +102,8 @@ import { clamp } from './operations/utils/parameters';
 import { getPatients } from './patient';
 import { preCommitValidation } from './precommit';
 import { replaceConditionalReferences, validateResourceReferences } from './references';
-import type { RepositoryAccessOperation, RepositoryAccessTracker } from './repository/access-tracker';
-import { createRepositoryAccessTracker, getLocalReferenceResourceTypes } from './repository/access-tracker';
+import type { RepositoryAccessOperation } from './repository/access-tracker';
+import { getLocalReferenceResourceTypes } from './repository/access-tracker';
 import { removeField } from './repository/field-utils';
 import { removeCachedProfile } from './repository/profile-cache';
 import type { StatementTimeoutOptions } from './repository/repository-connection';
@@ -265,7 +265,6 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
   private readonly context: RepositoryContext;
   private readonly connection: RepositoryConnection;
   private readonly ownsConnection: boolean;
-  private readonly accessTracker: RepositoryAccessTracker;
   private closed = false;
 
   /**
@@ -293,13 +292,12 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
    */
   static readonly VERSION: number = 14;
 
-  constructor(context: RepositoryContext, connection?: RepositoryConnection, accessTracker?: RepositoryAccessTracker) {
+  constructor(context: RepositoryContext, connection?: RepositoryConnection) {
     super();
     addSyntheticR4ProjectIfMissing(context);
     this.context = context;
     this.ownsConnection = connection === undefined;
     this.connection = connection ?? new RepositoryConnection();
-    this.accessTracker = accessTracker ?? createRepositoryAccessTracker();
     if (!this.context.author?.reference) {
       throw new Error('Invalid author reference');
     }
@@ -336,9 +334,9 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
     };
     if (this.connection.hasConnection()) {
       this.assertNotClosed();
-      return createSystemRepository(this.shardId, this.connection, contextDefaults, this.accessTracker);
+      return createSystemRepository(this.shardId, this.connection, contextDefaults);
     }
-    return createSystemRepository(this.shardId, undefined, contextDefaults, this.accessTracker);
+    return createSystemRepository(this.shardId, undefined, contextDefaults);
   }
 
   setMode(mode: RepositoryMode): void {
@@ -350,7 +348,7 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
     options: ExecuteSqlOptions
   ): Promise<T[]> {
     this.assertNotClosed();
-    this.accessTracker.recordResourceAccess('sql', options.operation, options.resourceTypes, options.source);
+    this.connection.recordResourceAccess('sql', options.operation, options.resourceTypes, options.source);
     return query.execute(this.getDatabaseClient(options.mode));
   }
 
@@ -2192,7 +2190,7 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
     options?: { serializable?: boolean }
   ): Promise<TResult> {
     this.assertNotClosed();
-    return this.connection.withTransaction(callback, this.accessTracker, options);
+    return this.connection.withTransaction(callback, options);
   }
 
   async withStatementTimeout<TResult>(
@@ -2230,7 +2228,7 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
     if (this.connection.isInTransaction()) {
       return undefined;
     }
-    this.accessTracker.recordResourceAccess('cache', 'read', [resourceType], 'repo.getCacheEntry');
+    this.connection.recordResourceAccess('cache', 'read', [resourceType], 'repo.getCacheEntry');
     return getResourceCacheEntry<T>(resourceType, id);
   }
 
@@ -2245,7 +2243,7 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
       return new Array(references.length);
     }
 
-    this.accessTracker.recordResourceAccess(
+    this.connection.recordResourceAccess(
       'cache',
       'read',
       getLocalReferenceResourceTypes(references),
@@ -2268,7 +2266,7 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
       return;
     }
 
-    this.accessTracker.recordResourceAccess('cache', 'write', [resource.resourceType], 'repo.setCacheEntry');
+    this.connection.recordResourceAccess('cache', 'write', [resource.resourceType], 'repo.setCacheEntry');
     await setResourceCacheEntry(resource);
   }
 
@@ -2284,7 +2282,7 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
       return;
     }
 
-    this.accessTracker.recordResourceAccess('cache', 'write', [resourceType], 'repo.deleteCacheEntry');
+    this.connection.recordResourceAccess('cache', 'write', [resourceType], 'repo.deleteCacheEntry');
     await deleteResourceCacheEntry(resourceType, id);
   }
 
@@ -2300,13 +2298,13 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
       return;
     }
 
-    this.accessTracker.recordResourceAccess('cache', 'write', [resourceType], 'repo.deleteCacheEntries');
+    this.connection.recordResourceAccess('cache', 'write', [resourceType], 'repo.deleteCacheEntries');
     await deleteResourceCacheEntries(resourceType, ids);
   }
 
   async ensureInTransaction<TResult>(callback: (client: PoolClient) => Promise<TResult>): Promise<TResult> {
     this.assertNotClosed();
-    return this.connection.ensureInTransaction(callback, this.accessTracker);
+    return this.connection.ensureInTransaction(callback);
   }
 
   getConfig(): RepositoryContext {
@@ -2337,14 +2335,12 @@ type SystemRepositoryContextDefaults = Pick<RepositoryContext, 'skipBackgroundJo
  * @param shardId - The shard ID.
  * @param connection - Optional repository connection for transaction support.
  * @param contextDefaults - Optional context defaults to apply before the fixed SystemRepository context.
- * @param accessTracker - Optional shared resource access tracker for related repository instances.
  * @returns A SystemRepository instance.
  */
 function createSystemRepository(
   shardId: string,
   connection?: RepositoryConnection,
-  contextDefaults?: SystemRepositoryContextDefaults,
-  accessTracker?: RepositoryAccessTracker
+  contextDefaults?: SystemRepositoryContextDefaults
 ): SystemRepository {
   return new SystemRepository(
     {
@@ -2358,8 +2354,7 @@ function createSystemRepository(
       },
       // System repo does not have an associated Project; it can write to any
     },
-    connection,
-    accessTracker
+    connection
   );
 }
 
