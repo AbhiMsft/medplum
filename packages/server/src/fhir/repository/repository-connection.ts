@@ -193,7 +193,6 @@ export class RepositoryConnection implements Disposable {
   ): Promise<TResult> {
     this.assertNotClosed();
     const isolationLevel = options?.serializable ? 'SERIALIZABLE' : 'REPEATABLE READ';
-    this.assertCompatibleTransactionIsolationLevel(isolationLevel);
 
     const config = getConfig();
     const transactionAttempts = config.transactionAttempts ?? defaultTransactionAttempts;
@@ -287,6 +286,7 @@ export class RepositoryConnection implements Disposable {
   private async beginTransaction(isolationLevel: TransactionIsolationLevel): Promise<PoolClient> {
     return this.withTransactionStateLock(async () => {
       this.assertNotClosed();
+      this.assertCompatibleTransactionIsolationLevel(isolationLevel);
       const nextDepth = this.transactionDepth + 1;
       const conn = await this.getConnection(DatabaseMode.WRITER);
       try {
