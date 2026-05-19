@@ -1703,6 +1703,76 @@ describe('FHIR Repo', () => {
     ]);
   });
 
+  test('withTransaction serializes concurrent root transactions on a shared connection', async () => {
+    const query = jest.fn(async (_sql: string) => ({ rows: [] }));
+    const client = {
+      query,
+      release: jest.fn(),
+    } as unknown as PoolClient;
+    const repo = getShardSystemRepo(
+      'test-shard',
+      RepositoryConnection.borrowClient(client, { mode: DatabaseMode.WRITER })
+    );
+    const firstStarted = Promise.withResolvers<undefined>();
+    const finishFirst = Promise.withResolvers<undefined>();
+    const events: string[] = [];
+
+    const tx1 = repo.withTransaction(async () => {
+      events.push('first start');
+      firstStarted.resolve(undefined);
+      await finishFirst.promise;
+      events.push('first finish');
+    });
+    await firstStarted.promise;
+
+    const tx2 = repo.withTransaction(async () => {
+      events.push('second start');
+    });
+    await Promise.resolve();
+
+    expect(events).toStrictEqual(['first start']);
+    finishFirst.resolve(undefined);
+    await Promise.all([tx1, tx2]);
+
+    expect(events).toStrictEqual(['first start', 'first finish', 'second start']);
+    expect(query.mock.calls.map(([sql]) => sql)).toStrictEqual([
+      'BEGIN ISOLATION LEVEL REPEATABLE READ',
+      'COMMIT',
+      'BEGIN ISOLATION LEVEL REPEATABLE READ',
+      'COMMIT',
+    ]);
+  });
+
+  test('withTransaction allows pre-commit callbacks to start nested transactions', async () => {
+    const query = jest.fn(async (_sql: string) => ({ rows: [] }));
+    const client = {
+      query,
+      release: jest.fn(),
+    } as unknown as PoolClient;
+    const repo = getShardSystemRepo(
+      'test-shard',
+      RepositoryConnection.borrowClient(client, { mode: DatabaseMode.WRITER })
+    );
+    const events: string[] = [];
+
+    await repo.withTransaction(async () => {
+      await repo.preCommit(async () => {
+        events.push('pre-commit start');
+        await repo.withTransaction(async () => {
+          events.push('nested transaction');
+        });
+      });
+    });
+
+    expect(events).toStrictEqual(['pre-commit start', 'nested transaction']);
+    expect(query.mock.calls.map(([sql]) => sql)).toStrictEqual([
+      'BEGIN ISOLATION LEVEL REPEATABLE READ',
+      'SAVEPOINT sp2',
+      'RELEASE SAVEPOINT sp2',
+      'COMMIT',
+    ]);
+  });
+
   test.each(['commit', 'rollback'])('Post-commit handling on %s', async (mode) => {
     const repo = systemRepo;
     const loggerErrorSpy = jest.spyOn(getLogger(), 'error').mockImplementation(() => {});
