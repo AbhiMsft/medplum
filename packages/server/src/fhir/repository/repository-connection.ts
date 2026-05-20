@@ -3,7 +3,6 @@
 import type { OperationOutcomeError } from '@medplum/core';
 import { normalizeErrorString, sleep } from '@medplum/core';
 import { RepositoryMode } from '@medplum/fhir-router';
-import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Pool, PoolClient } from 'pg';
 import { getConfig } from '../../config/loader';
 import { DatabaseMode, getDatabasePool } from '../../database';
@@ -21,11 +20,6 @@ const transactionIsolationLevelPriority: Record<TransactionIsolationLevel, numbe
 type CallbackFrame = {
   pre: number;
   post: number;
-};
-
-type TransactionFrame = {
-  active: boolean;
-  childTransactionLock: Promise<undefined>;
 };
 
 export type StatementTimeoutOptions = {
@@ -54,8 +48,6 @@ export class RepositoryConnection implements Disposable {
   private preCommitCallbacks: (() => Promise<void>)[] = [];
   private postCommitCallbacks: (() => Promise<void>)[] = [];
   private callbackStack: CallbackFrame[] = [];
-  private readonly transactionFrameStore = new AsyncLocalStorage<TransactionFrame>();
-  private transactionLifecycleLock: Promise<undefined> = Promise.resolve(undefined);
 
   /**
    * Creates a connection that owns any PoolClient it acquires.
@@ -199,133 +191,77 @@ export class RepositoryConnection implements Disposable {
     callback: (client: PoolClient) => Promise<TResult>,
     options?: { serializable?: boolean }
   ): Promise<TResult> {
-    return this.withTransactionLifecycleLock(async () => {
-      this.assertNotClosed();
-      const isolationLevel = options?.serializable ? 'SERIALIZABLE' : 'REPEATABLE READ';
+    this.assertNotClosed();
+    const isolationLevel = options?.serializable ? 'SERIALIZABLE' : 'REPEATABLE READ';
 
-      const config = getConfig();
-      const transactionAttempts = config.transactionAttempts ?? defaultTransactionAttempts;
-      let error: OperationOutcomeError | undefined;
-      for (let attempt = 0; attempt < transactionAttempts; attempt++) {
-        const attemptStartTime = Date.now();
-        let transactionStarted = false;
-        try {
-          const client = await this.beginTransaction(isolationLevel);
-          transactionStarted = true;
-          const result = await callback(client);
-          await this.commitTransaction();
-          if (attempt > 0) {
-            getLogger().info('Completed transaction', {
-              attempt,
-              attemptDurationMs: Date.now() - attemptStartTime,
-              transactionAttempts,
-              serializable: options?.serializable ?? false,
-            });
-          }
-          return result;
-        } catch (err) {
-          const operationOutcomeError = normalizeDatabaseError(err);
-          // Assigning here and throwing below is necessary to satisfy TypeScript
-          error = operationOutcomeError;
-
-          // Ensure transaction is rolled back before attempting any retry
-          if (transactionStarted) {
-            await this.rollbackTransaction(operationOutcomeError);
-          }
-          if (this.transactionDepth || !isRetryableTransactionError(operationOutcomeError)) {
-            break; // Fall through to throw statement outside of the loop
-          }
-        } finally {
-          this.endTransaction();
-        }
-
-        const attemptDurationMs = Date.now() - attemptStartTime;
-
-        if (attempt + 1 < transactionAttempts) {
-          const baseDelayMs = config.transactionExpBackoffBaseDelayMs ?? defaultExpBackoffBaseDelayMs;
-          // Attempts are 0-indexed, so first wait after first attempt will be somewhere between 75% and 125% of baseDelayMs
-          // This calculation results in something like this for the default values:
-          // Between attempt 0 and 1: 50 * (2^0) = 50 * [0.75, 1.25] = **[37.5, 63.5] ms**
-          // Between attempt 1 and 2: 50 * (2^1) = 100 * [0.75, 1.25] = **[75, 125] ms**
-          // etc...
-          const delayMs = Math.ceil(baseDelayMs * 2 ** attempt * (0.75 + Math.random() * 0.5));
-          getLogger().info('Retrying transaction', {
+    const config = getConfig();
+    const transactionAttempts = config.transactionAttempts ?? defaultTransactionAttempts;
+    let error: OperationOutcomeError | undefined;
+    for (let attempt = 0; attempt < transactionAttempts; attempt++) {
+      const attemptStartTime = Date.now();
+      let transactionStarted = false;
+      try {
+        const client = await this.beginTransaction(isolationLevel);
+        transactionStarted = true;
+        const result = await callback(client);
+        await this.commitTransaction();
+        if (attempt > 0) {
+          getLogger().info('Completed transaction', {
             attempt,
-            attemptDurationMs,
-            transactionAttempts,
-            serializable: options?.serializable ?? false,
-            delayMs,
-            baseDelayMs,
-          });
-          await sleep(delayMs);
-        } else {
-          getLogger().info('Transaction failed final attempt', {
-            attempt,
-            attemptDurationMs,
+            attemptDurationMs: Date.now() - attemptStartTime,
             transactionAttempts,
             serializable: options?.serializable ?? false,
           });
         }
+        return result;
+      } catch (err) {
+        const operationOutcomeError = normalizeDatabaseError(err);
+        // Assigning here and throwing below is necessary to satisfy TypeScript
+        error = operationOutcomeError;
+
+        // Ensure transaction is rolled back before attempting any retry
+        if (transactionStarted) {
+          await this.rollbackTransaction(operationOutcomeError);
+        }
+        if (this.transactionDepth || !isRetryableTransactionError(operationOutcomeError)) {
+          break; // Fall through to throw statement outside of the loop
+        }
+      } finally {
+        this.endTransaction();
       }
 
-      // Cannot be undefined: either the function returns normally from the `try` block,
-      // or `error` is assigned at top of `catch` block before reaching this line
-      throw error;
-    });
-  }
+      const attemptDurationMs = Date.now() - attemptStartTime;
 
-  private async withTransactionLifecycleLock<T>(callback: () => Promise<T>): Promise<T> {
-    const parentFrame = this.transactionFrameStore.getStore();
-    if (parentFrame?.active) {
-      return this.withChildTransactionLifecycleLock(parentFrame, callback);
+      if (attempt + 1 < transactionAttempts) {
+        const baseDelayMs = config.transactionExpBackoffBaseDelayMs ?? defaultExpBackoffBaseDelayMs;
+        // Attempts are 0-indexed, so first wait after first attempt will be somewhere between 75% and 125% of baseDelayMs
+        // This calculation results in something like this for the default values:
+        // Between attempt 0 and 1: 50 * (2^0) = 50 * [0.75, 1.25] = **[37.5, 63.5] ms**
+        // Between attempt 1 and 2: 50 * (2^1) = 100 * [0.75, 1.25] = **[75, 125] ms**
+        // etc...
+        const delayMs = Math.ceil(baseDelayMs * 2 ** attempt * (0.75 + Math.random() * 0.5));
+        getLogger().info('Retrying transaction', {
+          attempt,
+          attemptDurationMs,
+          transactionAttempts,
+          serializable: options?.serializable ?? false,
+          delayMs,
+          baseDelayMs,
+        });
+        await sleep(delayMs);
+      } else {
+        getLogger().info('Transaction failed final attempt', {
+          attempt,
+          attemptDurationMs,
+          transactionAttempts,
+          serializable: options?.serializable ?? false,
+        });
+      }
     }
 
-    const release = await this.acquireTransactionLifecycleLock();
-    const frame: TransactionFrame = { active: true, childTransactionLock: Promise.resolve(undefined) };
-
-    try {
-      return await this.transactionFrameStore.run(frame, callback);
-    } finally {
-      frame.active = false;
-      release();
-    }
-  }
-
-  private async withChildTransactionLifecycleLock<T>(
-    parentFrame: TransactionFrame,
-    callback: () => Promise<T>
-  ): Promise<T> {
-    const release = await this.acquireChildTransactionLock(parentFrame);
-    if (!parentFrame.active) {
-      release();
-      return this.withTransactionLifecycleLock(callback);
-    }
-
-    const frame: TransactionFrame = { active: true, childTransactionLock: Promise.resolve(undefined) };
-    try {
-      return await this.transactionFrameStore.run(frame, callback);
-    } finally {
-      frame.active = false;
-      release();
-    }
-  }
-
-  private async acquireTransactionLifecycleLock(): Promise<() => void> {
-    const previous = this.transactionLifecycleLock;
-    const { promise, resolve } = Promise.withResolvers<undefined>();
-    this.transactionLifecycleLock = promise;
-
-    await previous;
-    return () => resolve(undefined);
-  }
-
-  private async acquireChildTransactionLock(frame: TransactionFrame): Promise<() => void> {
-    const previous = frame.childTransactionLock;
-    const { promise, resolve } = Promise.withResolvers<undefined>();
-    frame.childTransactionLock = promise;
-
-    await previous;
-    return () => resolve(undefined);
+    // Cannot be undefined: either the function returns normally from the `try` block,
+    // or `error` is assigned at top of `catch` block before reaching this line
+    throw error;
   }
 
   // FIFO queue of promises to wait for the transaction state lock
@@ -382,25 +318,17 @@ export class RepositoryConnection implements Disposable {
   }
 
   private async commitTransaction(): Promise<void> {
-    const isOuter = await this.withTransactionStateLock(async () => {
-      this.assertInTransaction();
-      return this.transactionDepth === 1;
-    });
-
-    if (isOuter) {
-      await this.processPreCommit();
-    }
-
-    const shouldProcessPostCommit = await this.withTransactionStateLock(async () => {
+    return this.withTransactionStateLock(async () => {
       this.assertInTransaction();
       const conn = await this.getConnection(DatabaseMode.WRITER);
       if (this.transactionDepth === 1) {
+        await this.processPreCommit();
         await conn.query('COMMIT');
         this.transactionDepth = 0;
         this.transactionIsolationLevel = undefined;
         this.releaseConnection();
         this.clearCallbackStack();
-        return true;
+        await this.processPostCommit();
       } else {
         // If RELEASE SAVEPOINT fails (e.g. transaction in aborted state), let the error propagate.
         // withTransaction's catch will invoke rollbackTransaction, which can run ROLLBACK TO SAVEPOINT
@@ -409,13 +337,8 @@ export class RepositoryConnection implements Disposable {
         await conn.query('RELEASE SAVEPOINT sp' + this.transactionDepth);
         this.transactionDepth--; // safe to decrement since assertInTransaction() ensures transactionDepth > 0
         this.popCallbackFrame();
-        return false;
       }
     });
-
-    if (shouldProcessPostCommit) {
-      await this.processPostCommit();
-    }
   }
 
   private async rollbackTransaction(error: Error): Promise<void> {

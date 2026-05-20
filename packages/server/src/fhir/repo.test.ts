@@ -1703,8 +1703,21 @@ describe('FHIR Repo', () => {
     ]);
   });
 
-  test('withTransaction serializes concurrent root transactions on a shared connection', async () => {
-    const query = jest.fn(async (_sql: string) => ({ rows: [] }));
+  test('withTransactionStateLock serializes concurrent transaction begins', async () => {
+    const beginIssued = Promise.withResolvers<undefined>();
+    const allowBegin = Promise.withResolvers<undefined>();
+    const finishFirstTransaction = Promise.withResolvers<undefined>();
+    const secondCallbackStarted = Promise.withResolvers<undefined>();
+    const queries: string[] = [];
+    let beginCount = 0;
+    const query = jest.fn(async (sql: string) => {
+      queries.push(sql);
+      if (sql === 'BEGIN ISOLATION LEVEL REPEATABLE READ' && ++beginCount === 1) {
+        beginIssued.resolve(undefined);
+        await allowBegin.promise;
+      }
+      return { rows: [] };
+    });
     const client = {
       query,
       release: jest.fn(),
@@ -1713,64 +1726,168 @@ describe('FHIR Repo', () => {
       'test-shard',
       RepositoryConnection.borrowClient(client, { mode: DatabaseMode.WRITER })
     );
-    const firstStarted = Promise.withResolvers<undefined>();
-    const finishFirst = Promise.withResolvers<undefined>();
-    const events: string[] = [];
 
     const tx1 = repo.withTransaction(async () => {
-      events.push('first start');
-      firstStarted.resolve(undefined);
-      await finishFirst.promise;
-      events.push('first finish');
+      await finishFirstTransaction.promise;
     });
-    await firstStarted.promise;
+    await beginIssued.promise;
 
     const tx2 = repo.withTransaction(async () => {
-      events.push('second start');
+      secondCallbackStarted.resolve(undefined);
     });
     await Promise.resolve();
+    await Promise.resolve();
 
-    expect(events).toStrictEqual(['first start']);
-    finishFirst.resolve(undefined);
+    // The second begin must wait until the first BEGIN has completed and published transactionDepth.
+    expect(queries).toStrictEqual(['BEGIN ISOLATION LEVEL REPEATABLE READ']);
+
+    allowBegin.resolve(undefined);
+    await secondCallbackStarted.promise;
+    finishFirstTransaction.resolve(undefined);
     await Promise.all([tx1, tx2]);
 
-    expect(events).toStrictEqual(['first start', 'first finish', 'second start']);
-    expect(query.mock.calls.map(([sql]) => sql)).toStrictEqual([
-      'BEGIN ISOLATION LEVEL REPEATABLE READ',
-      'COMMIT',
-      'BEGIN ISOLATION LEVEL REPEATABLE READ',
-      'COMMIT',
-    ]);
-  });
-
-  test('withTransaction allows pre-commit callbacks to start nested transactions', async () => {
-    const query = jest.fn(async (_sql: string) => ({ rows: [] }));
-    const client = {
-      query,
-      release: jest.fn(),
-    } as unknown as PoolClient;
-    const repo = getShardSystemRepo(
-      'test-shard',
-      RepositoryConnection.borrowClient(client, { mode: DatabaseMode.WRITER })
-    );
-    const events: string[] = [];
-
-    await repo.withTransaction(async () => {
-      await repo.preCommit(async () => {
-        events.push('pre-commit start');
-        await repo.withTransaction(async () => {
-          events.push('nested transaction');
-        });
-      });
-    });
-
-    expect(events).toStrictEqual(['pre-commit start', 'nested transaction']);
-    expect(query.mock.calls.map(([sql]) => sql)).toStrictEqual([
+    expect(queries).toStrictEqual([
       'BEGIN ISOLATION LEVEL REPEATABLE READ',
       'SAVEPOINT sp2',
       'RELEASE SAVEPOINT sp2',
       'COMMIT',
     ]);
+  });
+
+  test('withTransactionStateLock serializes concurrent transaction commits', async () => {
+    const firstStarted = Promise.withResolvers<undefined>();
+    const secondStarted = Promise.withResolvers<undefined>();
+    const finishTransactions = Promise.withResolvers<undefined>();
+    const releaseSavepointIssued = Promise.withResolvers<undefined>();
+    const allowReleaseSavepoint = Promise.withResolvers<undefined>();
+    const queries: string[] = [];
+    let releaseSavepointCount = 0;
+    const query = jest.fn(async (sql: string) => {
+      queries.push(sql);
+      if (sql === 'RELEASE SAVEPOINT sp2' && ++releaseSavepointCount === 1) {
+        releaseSavepointIssued.resolve(undefined);
+        await allowReleaseSavepoint.promise;
+      }
+      return { rows: [] };
+    });
+    const client = {
+      query,
+      release: jest.fn(),
+    } as unknown as PoolClient;
+    const repo = getShardSystemRepo(
+      'test-shard',
+      RepositoryConnection.borrowClient(client, { mode: DatabaseMode.WRITER })
+    );
+
+    const tx1 = repo.withTransaction(async () => {
+      firstStarted.resolve(undefined);
+      await secondStarted.promise;
+      await finishTransactions.promise;
+    });
+    await firstStarted.promise;
+
+    const tx2 = repo.withTransaction(async () => {
+      secondStarted.resolve(undefined);
+      await finishTransactions.promise;
+    });
+    await secondStarted.promise;
+
+    expect(queries).toStrictEqual(['BEGIN ISOLATION LEVEL REPEATABLE READ', 'SAVEPOINT sp2']);
+    finishTransactions.resolve(undefined);
+    await releaseSavepointIssued.promise;
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The other commit path must wait until transactionDepth is decremented after RELEASE SAVEPOINT.
+    expect(queries).toStrictEqual([
+      'BEGIN ISOLATION LEVEL REPEATABLE READ',
+      'SAVEPOINT sp2',
+      'RELEASE SAVEPOINT sp2',
+    ]);
+
+    allowReleaseSavepoint.resolve(undefined);
+    await Promise.all([tx1, tx2]);
+
+    expect(queries).toStrictEqual([
+      'BEGIN ISOLATION LEVEL REPEATABLE READ',
+      'SAVEPOINT sp2',
+      'RELEASE SAVEPOINT sp2',
+      'COMMIT',
+    ]);
+  });
+
+  test('withTransactionStateLock serializes concurrent transaction rollbacks', async () => {
+    const firstStarted = Promise.withResolvers<undefined>();
+    const secondStarted = Promise.withResolvers<undefined>();
+    const failTransactions = Promise.withResolvers<undefined>();
+    const rollbackSavepointIssued = Promise.withResolvers<undefined>();
+    const allowRollbackSavepoint = Promise.withResolvers<undefined>();
+    const queries: string[] = [];
+    let rollbackSavepointCount = 0;
+    const query = jest.fn(async (sql: string) => {
+      queries.push(sql);
+      if (sql === 'ROLLBACK TO SAVEPOINT sp2' && ++rollbackSavepointCount === 1) {
+        rollbackSavepointIssued.resolve(undefined);
+        await allowRollbackSavepoint.promise;
+      }
+      return { rows: [] };
+    });
+    const client = {
+      query,
+      release: jest.fn(),
+    } as unknown as PoolClient;
+    const repo = getShardSystemRepo(
+      'test-shard',
+      RepositoryConnection.borrowClient(client, { mode: DatabaseMode.WRITER })
+    );
+    const errorSpy = jest.spyOn(getLogger(), 'error').mockImplementation(() => {});
+
+    try {
+      const tx1 = repo
+        .withTransaction(async () => {
+          firstStarted.resolve(undefined);
+          await secondStarted.promise;
+          await failTransactions.promise;
+          throw new Error('first rollback');
+        })
+        .catch((err) => err);
+      await firstStarted.promise;
+
+      const tx2 = repo
+        .withTransaction(async () => {
+          secondStarted.resolve(undefined);
+          await failTransactions.promise;
+          throw new Error('second rollback');
+        })
+        .catch((err) => err);
+      await secondStarted.promise;
+
+      expect(queries).toStrictEqual(['BEGIN ISOLATION LEVEL REPEATABLE READ', 'SAVEPOINT sp2']);
+      failTransactions.resolve(undefined);
+      await rollbackSavepointIssued.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // The other rollback path must wait until transactionDepth is decremented after ROLLBACK TO SAVEPOINT.
+      expect(queries).toStrictEqual([
+        'BEGIN ISOLATION LEVEL REPEATABLE READ',
+        'SAVEPOINT sp2',
+        'ROLLBACK TO SAVEPOINT sp2',
+      ]);
+
+      allowRollbackSavepoint.resolve(undefined);
+      const results = await Promise.all([tx1, tx2]);
+
+      expect(results).toEqual([expect.any(Error), expect.any(Error)]);
+      expect(queries).toStrictEqual([
+        'BEGIN ISOLATION LEVEL REPEATABLE READ',
+        'SAVEPOINT sp2',
+        'ROLLBACK TO SAVEPOINT sp2',
+        'ROLLBACK',
+      ]);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   test.each(['commit', 'rollback'])('Post-commit handling on %s', async (mode) => {
